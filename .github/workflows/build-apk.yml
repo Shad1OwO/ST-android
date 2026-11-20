@@ -24,13 +24,35 @@ jobs:
           echo "VERSION_NAME=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
           echo "VERSION_CODE=${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
 
+      # The Node.js compile takes hours, so the finished binary is cached. The key changes whenever
+      # the node submodule commit, the patches, the Node build scripts or the build image change.
+      - name: Compute Node.js cache key
+        id: nodekey
+        run: echo "node_sha=$(git rev-parse HEAD:node)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached Node.js binary
+        id: nodecache
+        uses: actions/cache/restore@v4
+        with:
+          path: out/android/arm64/node
+          key: node-arm64-${{ steps.nodekey.outputs.node_sha }}-${{ hashFiles('tools/patches/*.patch', 'tools/node/scripts/*.sh', 'ci/docker/Dockerfile') }}
+
       - name: Build APK (Docker)
         run: bash ci/scripts/build_apk_docker.sh
         env:
+          SKIP_NODE_BUILD: ${{ steps.nodecache.outputs.cache-hit == 'true' && '1' || '' }}
           RELEASE_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
           RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+
+      # Runs even if a later part of the build failed, so a finished Node.js compile is never thrown away.
+      - name: Save Node.js binary to cache
+        if: always() && steps.nodecache.outputs.cache-hit != 'true' && hashFiles('out/android/arm64/node') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: out/android/arm64/node
+          key: ${{ steps.nodecache.outputs.cache-primary-key }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

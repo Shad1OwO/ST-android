@@ -41,6 +41,10 @@ fi
 if [ -n "${GITHUB_RUN_NUMBER:-}" ]; then
   DOCKER_ENV_ARGS+=(-e "GITHUB_RUN_NUMBER=${GITHUB_RUN_NUMBER}")
 fi
+# Set by CI when out/android/arm64/node was restored from cache.
+if [ -n "${SKIP_NODE_BUILD:-}" ]; then
+  DOCKER_ENV_ARGS+=(-e "SKIP_NODE_BUILD=${SKIP_NODE_BUILD}")
+fi
 
 docker run --rm \
   -u "$(id -u):$(id -g)" \
@@ -98,7 +102,11 @@ docker run --rm \
       exit 1; \
     fi; \
     python3 ci/scripts/check_elf_align.py "$TOOLCHAIN/bin/llvm-readelf" "$LIBCXX_PATH"; \
-    ./tools/node/scripts/build_node_android.sh arm64; \
+    if [ "${SKIP_NODE_BUILD:-}" = "1" ] && [ -f out/android/arm64/node ]; then \
+      echo "Using cached Node.js binary: out/android/arm64/node"; \
+    else \
+      ./tools/node/scripts/build_node_android.sh arm64; \
+    fi; \
     mkdir -p app/src/main/jniLibs/arm64-v8a; \
     cp out/android/arm64/node app/src/main/jniLibs/arm64-v8a/libnode.so; \
     cp "$LIBCXX_PATH" app/src/main/jniLibs/arm64-v8a/libc++_shared.so; \
