@@ -105,7 +105,7 @@ fun ManageStScreen(
     onResetToDefault: () -> Unit,
     externalFileAccessEnabled: Boolean,
     onExternalFileAccessChanged: (Boolean) -> Unit,
-    onOpenExternalViewer: () -> Unit,
+    onOpenExternalViewer: (String) -> Unit,
     onRemoveUserData: () -> Unit
 ) {
     val allRefsByKey = remember(allRefs) { allRefs.associateBy { it.key } }
@@ -214,10 +214,17 @@ fun ManageStScreen(
                     if (externalFileAccessEnabled) {
                         Spacer(modifier = Modifier.height(10.dp))
                         OutlinedButton(
-                            onClick = onOpenExternalViewer,
+                            onClick = { onOpenExternalViewer(SillyTavernDocumentsProvider.ROOT_ID) },
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Text(text = stringResource(R.string.external_file_access_open))
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = { onOpenExternalViewer(SillyTavernDocumentsProvider.ST_ROOT_ID) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(text = stringResource(R.string.external_file_access_open_st))
                         }
                     }
                     Spacer(modifier = Modifier.height(8.dp))

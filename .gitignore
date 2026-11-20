@@ -45,3 +45,5 @@ google-services.json
 /app/src/main/assets/node_payload/npm.tar
 /app/src/main/assets/node_payload/manifest.json
 /app/src/main/assets/legal/sillytavern_package-lock.json
+
+.claude/

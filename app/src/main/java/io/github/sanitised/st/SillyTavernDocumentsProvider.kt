@@ -15,7 +15,10 @@ import java.nio.file.Files
 class SillyTavernDocumentsProvider : DocumentsProvider() {
     companion object {
         const val ROOT_ID = "sillytavern-data"
+        const val ST_ROOT_ID = "sillytavern-root"
         private const val ROOT_DOCUMENT_ID = "data"
+        private const val ST_ROOT_DOCUMENT_ID = "st"
+        private const val ROOTS_CACHE_MS = 1000L
 
         private val DEFAULT_ROOT_PROJECTION = arrayOf(
             DocumentsContract.Root.COLUMN_ROOT_ID,
@@ -36,6 +39,13 @@ class SillyTavernDocumentsProvider : DocumentsProvider() {
         )
     }
 
+    private class RootSpec(
+        val rootId: String,
+        val documentPrefix: String,
+        val titleRes: Int,
+        val declaredDir: File
+    )
+
     override fun onCreate(): Boolean = true
 
     override fun queryRoots(projection: Array<out String>?): Cursor {
@@ -48,8 +58,11 @@ class SillyTavernDocumentsProvider : DocumentsProvider() {
         )
         if (!ExternalFileAccess.isEnabled(providerContext)) return cursor
 
-        requireRoot()
-        addRootRow(cursor, columns)
+        for (spec in rootSpecs()) {
+            // A broken root must not hide the other one.
+            runCatching { validateRoot(spec) }.getOrNull() ?: continue
+            addRootRow(cursor, columns, spec)
+        }
         return cursor
     }
 
@@ -98,6 +111,7 @@ class SillyTavernDocumentsProvider : DocumentsProvider() {
         requireEnabled()
         val file = resolveDocument(documentId)
         if (!file.isFile) throw FileNotFoundException("Not a file")
+        val root = rootForDocument(documentId).second
         val truncateAfterValidation = mode == "w" || mode == "wt" || mode == "rwt"
         val requestedMode = ParcelFileDescriptor.parseMode(mode)
         val safeOpenMode = requestedMode and
@@ -110,9 +124,9 @@ class SillyTavernDocumentsProvider : DocumentsProvider() {
             descriptor.close()
             throw FileNotFoundException("Could not validate opened document")
         }
-        if (!openedFile.toPath().startsWith(requireRoot().toPath())) {
+        if (!openedFile.toPath().startsWith(root.toPath())) {
             descriptor.close()
-            throw FileNotFoundException("Document is outside the data directory")
+            throw FileNotFoundException("Document is outside the exposed directories")
         }
         if (truncateAfterValidation) {
             runCatching { Os.ftruncate(descriptor.fileDescriptor, 0L) }
@@ -149,7 +163,7 @@ class SillyTavernDocumentsProvider : DocumentsProvider() {
     override fun deleteDocument(documentId: String) {
         requireEnabled()
         val file = resolveDocument(documentId)
-        if (file == requireRoot()) throw FileNotFoundException("The root cannot be deleted")
+        if (isRoot(file)) throw FileNotFoundException("The root cannot be deleted")
         val parentId = documentIdFor(file.parentFile ?: throw FileNotFoundException("Missing parent"))
         if (!deleteTreeWithoutFollowingLinks(file)) {
             throw FileNotFoundException("Could not delete document")
@@ -162,7 +176,7 @@ class SillyTavernDocumentsProvider : DocumentsProvider() {
         requireEnabled()
         validateDisplayName(displayName)
         val file = resolveDocument(documentId)
-        if (file == requireRoot()) throw FileNotFoundException("The root cannot be renamed")
+        if (isRoot(file)) throw FileNotFoundException("The root cannot be renamed")
         val parent = file.parentFile ?: throw FileNotFoundException("Missing parent")
         val target = validateNewChild(parent, displayName)
         if (target.exists()) throw FileNotFoundException("A file with that name already exists")
@@ -178,7 +192,7 @@ class SillyTavernDocumentsProvider : DocumentsProvider() {
     ): String {
         requireEnabled()
         val source = resolveDocument(sourceDocumentId)
-        if (source == requireRoot()) throw FileNotFoundException("The root cannot be moved")
+        if (isRoot(source)) throw FileNotFoundException("The root cannot be moved")
         val sourceParent = resolveDocument(sourceParentDocumentId)
         val targetParent = resolveDocument(targetParentDocumentId)
         if (!sourceParent.isDirectory || source.parentFile?.canonicalFile != sourceParent) {
@@ -217,29 +231,69 @@ class SillyTavernDocumentsProvider : DocumentsProvider() {
         }
     }
 
-    private fun requireRoot(): File {
+    private fun rootSpecs(): List<RootSpec> {
+        val providerContext = context ?: throw FileNotFoundException("Provider is unavailable")
+        val paths = AppPaths(providerContext)
+        return listOf(
+            RootSpec(ROOT_ID, ROOT_DOCUMENT_ID, R.string.external_file_access_root_title, paths.dataDir),
+            RootSpec(ST_ROOT_ID, ST_ROOT_DOCUMENT_ID, R.string.external_file_access_st_root_title, paths.stDir)
+        )
+    }
+
+    private fun validateRoot(spec: RootSpec): File {
         val providerContext = context ?: throw FileNotFoundException("Provider is unavailable")
         val filesRoot = providerContext.filesDir.canonicalFile
-        val declaredRoot = AppPaths(providerContext).dataDir
+        val declaredRoot = spec.declaredDir
         if (Files.isSymbolicLink(declaredRoot.toPath())) {
-            throw FileNotFoundException("Data directory cannot be a symbolic link")
+            throw FileNotFoundException("Root directory cannot be a symbolic link")
         }
         if (!declaredRoot.exists() && !declaredRoot.mkdirs()) {
-            throw FileNotFoundException("Data directory is unavailable")
+            throw FileNotFoundException("Root directory is unavailable")
         }
-        if (!declaredRoot.isDirectory) throw FileNotFoundException("Data directory is unavailable")
+        if (!declaredRoot.isDirectory) throw FileNotFoundException("Root directory is unavailable")
         val root = declaredRoot.canonicalFile
-        if (root.parentFile != filesRoot) throw FileNotFoundException("Invalid data directory")
+        if (root.parentFile != filesRoot) throw FileNotFoundException("Invalid root directory")
         return root
     }
 
+    // Root validation stats the filesystem; cache briefly so listing large
+    // directories (e.g. node_modules) does not revalidate roots per row.
+    private var rootsCache: List<Pair<RootSpec, File>>? = null
+    private var rootsCacheAt: Long = 0L
+
+    private fun requireRoots(): List<Pair<RootSpec, File>> {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val cached = rootsCache
+        if (cached != null && now - rootsCacheAt < ROOTS_CACHE_MS) return cached
+        val roots = rootSpecs().map { spec -> spec to validateRoot(spec) }
+        rootsCache = roots
+        rootsCacheAt = now
+        return roots
+    }
+
+    private fun rootForDocument(documentId: String): Pair<RootSpec, File> {
+        val prefix = documentId.substringBefore('/')
+        val spec = rootSpecs().firstOrNull { it.documentPrefix == prefix }
+            ?: throw FileNotFoundException("Invalid document ID")
+        return spec to validateRoot(spec)
+    }
+
+    private fun rootForFile(file: File): Pair<RootSpec, File> {
+        val canonical = file.canonicalFile
+        return requireRoots().firstOrNull { (_, root) -> canonical.toPath().startsWith(root.toPath()) }
+            ?: throw FileNotFoundException("Document is outside the exposed directories")
+    }
+
+    private fun isRoot(file: File): Boolean =
+        requireRoots().any { (_, root) -> file == root }
+
     private fun resolveDocument(documentId: String): File {
-        val root = requireRoot()
-        if (documentId == ROOT_DOCUMENT_ID) return root
-        if (!documentId.startsWith("$ROOT_DOCUMENT_ID/")) {
+        val (spec, root) = rootForDocument(documentId)
+        if (documentId == spec.documentPrefix) return root
+        if (!documentId.startsWith("${spec.documentPrefix}/")) {
             throw FileNotFoundException("Invalid document ID")
         }
-        val segments = documentId.removePrefix("$ROOT_DOCUMENT_ID/").split('/')
+        val segments = documentId.removePrefix("${spec.documentPrefix}/").split('/')
         if (segments.isEmpty() || segments.any { it.isEmpty() || it == "." || it == ".." || '\u0000' in it }) {
             throw FileNotFoundException("Invalid document ID")
         }
@@ -255,20 +309,18 @@ class SillyTavernDocumentsProvider : DocumentsProvider() {
     }
 
     private fun validateExistingFile(file: File): File {
-        val root = requireRoot()
         if (Files.isSymbolicLink(file.toPath())) {
             throw FileNotFoundException("Symbolic links are not exposed")
         }
         val canonical = file.canonicalFile
-        if (!canonical.toPath().startsWith(root.toPath()) || !canonical.exists()) {
-            throw FileNotFoundException("Document is outside the data directory")
-        }
+        if (!canonical.exists()) throw FileNotFoundException("Document does not exist")
+        rootForFile(canonical)
         return canonical
     }
 
     private fun validateNewChild(parent: File, displayName: String): File {
-        val root = requireRoot()
         val canonicalParent = validateExistingFile(parent)
+        val root = rootForFile(canonicalParent).second
         val child = File(canonicalParent, displayName)
         if (Files.isSymbolicLink(child.toPath())) {
             throw FileNotFoundException("Symbolic links are not exposed")
@@ -294,12 +346,12 @@ class SillyTavernDocumentsProvider : DocumentsProvider() {
     }
 
     private fun documentIdFor(file: File): String {
-        val root = requireRoot()
         val canonical = validateExistingFile(file)
-        if (canonical == root) return ROOT_DOCUMENT_ID
+        val (spec, root) = rootForFile(canonical)
+        if (canonical == root) return spec.documentPrefix
         val relative = root.toPath().relativize(canonical.toPath())
             .joinToString("/") { it.toString() }
-        return "$ROOT_DOCUMENT_ID/$relative"
+        return "${spec.documentPrefix}/$relative"
     }
 
     private fun mimeType(file: File): String {
@@ -310,7 +362,7 @@ class SillyTavernDocumentsProvider : DocumentsProvider() {
     }
 
     private fun documentFlags(file: File): Int {
-        if (file == requireRoot()) {
+        if (isRoot(file)) {
             return DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE
         }
         return if (file.isDirectory) {
@@ -326,12 +378,12 @@ class SillyTavernDocumentsProvider : DocumentsProvider() {
         }
     }
 
-    private fun addRootRow(cursor: MatrixCursor, columns: Array<out String>) {
+    private fun addRootRow(cursor: MatrixCursor, columns: Array<out String>, spec: RootSpec) {
         val values = columns.map { column ->
             when (column) {
-                DocumentsContract.Root.COLUMN_ROOT_ID -> ROOT_ID
-                DocumentsContract.Root.COLUMN_DOCUMENT_ID -> ROOT_DOCUMENT_ID
-                DocumentsContract.Root.COLUMN_TITLE -> context?.getString(R.string.external_file_access_root_title)
+                DocumentsContract.Root.COLUMN_ROOT_ID -> spec.rootId
+                DocumentsContract.Root.COLUMN_DOCUMENT_ID -> spec.documentPrefix
+                DocumentsContract.Root.COLUMN_TITLE -> context?.getString(spec.titleRes)
                 DocumentsContract.Root.COLUMN_FLAGS ->
                     DocumentsContract.Root.FLAG_SUPPORTS_CREATE or
                         DocumentsContract.Root.FLAG_SUPPORTS_IS_CHILD or
@@ -345,11 +397,12 @@ class SillyTavernDocumentsProvider : DocumentsProvider() {
     }
 
     private fun addDocumentRow(cursor: MatrixCursor, columns: Array<out String>, file: File) {
+        val rootTitle = requireRoots().firstOrNull { (_, root) -> file == root }
+            ?.let { (spec, _) -> context?.getString(spec.titleRes) }
         val values = columns.map { column ->
             when (column) {
                 DocumentsContract.Document.COLUMN_DOCUMENT_ID -> documentIdFor(file)
-                DocumentsContract.Document.COLUMN_DISPLAY_NAME ->
-                    if (file == requireRoot()) context?.getString(R.string.external_file_access_root_title) else file.name
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME -> rootTitle ?: file.name
                 DocumentsContract.Document.COLUMN_MIME_TYPE -> mimeType(file)
                 DocumentsContract.Document.COLUMN_FLAGS -> documentFlags(file)
                 DocumentsContract.Document.COLUMN_SIZE -> if (file.isFile) file.length() else null

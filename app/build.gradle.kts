@@ -25,7 +25,7 @@ android {
         && !releaseKeyAlias.isNullOrBlank()
 
     defaultConfig {
-        applicationId = "io.github.sanitised.st"
+        applicationId = "com.shadwow.st.extended"
         minSdk = 26
         targetSdk = 36
 

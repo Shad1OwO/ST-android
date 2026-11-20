@@ -474,8 +474,8 @@ class MainActivity : ComponentActivity() {
                             onExternalFileAccessChanged = { enabled ->
                                 viewModel.setExternalFileAccessEnabled(enabled)
                             },
-                            onOpenExternalViewer = {
-                                if (!openExternalFileViewer()) {
+                            onOpenExternalViewer = { rootId ->
+                                if (!openExternalFileViewer(rootId)) {
                                     viewModel.showTransientMessage(
                                         getString(R.string.external_file_access_viewer_failed)
                                     )
@@ -670,11 +670,11 @@ class MainActivity : ComponentActivity() {
         startActivity(intent)
     }
 
-    private fun openExternalFileViewer(): Boolean {
+    private fun openExternalFileViewer(rootId: String): Boolean {
         if (!ExternalFileAccess.isEnabled(this)) return false
         val rootUri = DocumentsContract.buildRootUri(
             ExternalFileAccess.authority(this),
-            SillyTavernDocumentsProvider.ROOT_ID
+            rootId
         )
         val intent = Intent(Intent.ACTION_VIEW, rootUri).apply {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)

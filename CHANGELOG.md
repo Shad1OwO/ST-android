@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Changed the application ID to com.shadwow.st.extended. Installs alongside the original app; transfer data via export/import.
+- External file access now exposes the SillyTavern installation folder in addition to the data folder.
+
 ## 0.5.1
 
 - Updated the bundled SillyTavern to 1.19.0.
