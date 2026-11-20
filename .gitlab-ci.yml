@@ -1,0 +1,162 @@
+# GitLab CI build for ST-android (works on gitlab.com and self-hosted GitLab such as gitgud.io).
+#
+# Mirrors ci/scripts/build_apk_docker.sh, but runs directly inside the job image instead of
+# calling `docker build` / `docker run` (which shared runners usually do not allow).
+#
+# Requirements:
+#   - An x86_64 Linux runner with the Docker executor (the Android NDK toolchain is linux-x86_64 only).
+#   - Job timeout of at least ~4h for the first run (Settings > CI/CD > General pipelines > Timeout).
+#     Later runs reuse the cached Node.js binary and take minutes, as long as the runner keeps its cache.
+#
+# Runs when you press "Run pipeline" in the web UI, or when you push a tag.
+#
+# Optional CI/CD variables (Settings > CI/CD > Variables):
+#   RELEASE_KEYSTORE_B64, RELEASE_STORE_PASSWORD, RELEASE_KEY_ALIAS, RELEASE_KEY_PASSWORD
+#       -> signed release APK. Without them you get a debug APK.
+#   NINJA_JOBS    -> parallel compile jobs for Node.js (default: number of CPUs).
+#   REBUILD_NODE  -> set to 1 to ignore the cached Node.js binary.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_TAG
+
+stages:
+  - build
+
+build_apk:
+  stage: build
+  image: ghcr.io/cirruslabs/android-sdk:36-ndk
+  timeout: 5h
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_SUBMODULE_DEPTH: "1"
+    NODE_VERSION: "24.22.1"
+    GRADLE_VERSION: "8.8"
+    ANDROID_API: "26"
+    NODE_CACHE_DIR: "$CI_PROJECT_DIR/.ci-cache/node-arm64"
+    GRADLE_USER_HOME: "$CI_PROJECT_DIR/.ci-cache/gradle-home"
+    NPM_CONFIG_CACHE: "$CI_PROJECT_DIR/.ci-cache/npm"
+  cache:
+    - key: node-arm64-v1
+      paths:
+        - .ci-cache/node-arm64/
+      # Save even if a later step fails, so a finished Node.js compile is never thrown away.
+      when: always
+    - key: gradle-npm-v1
+      paths:
+        - .ci-cache/gradle-home/caches/
+        - .ci-cache/gradle-home/wrapper/
+        - .ci-cache/npm/
+  before_script:
+    - |
+      set -eo pipefail
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        curl ca-certificates git patch unzip python3 ninja-build make g++ xz-utils
+      rm -rf /var/lib/apt/lists/*
+
+      curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -o /tmp/node.tar.xz
+      tar -xJf /tmp/node.tar.xz -C /opt
+      export PATH="/opt/node-v${NODE_VERSION}-linux-x64/bin:${PATH}"
+
+      curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip
+      unzip -q /tmp/gradle.zip -d /opt/gradle
+      export PATH="/opt/gradle/gradle-${GRADLE_VERSION}/bin:${PATH}"
+
+      yes | sdkmanager --licenses > /dev/null 2>&1 || true
+      sdkmanager "build-tools;34.0.0"
+
+      node --version
+      gradle --version
+  script:
+    - |
+      set -eo pipefail
+
+      # --- Locate the NDK and libc++ -------------------------------------------------------
+      NDK_ROOT="${ANDROID_NDK_HOME:-}"
+      if [ -z "$NDK_ROOT" ]; then NDK_ROOT="$(ls -d /opt/android-sdk/ndk/* 2>/dev/null | head -n1 || true)"; fi
+      if [ -z "$NDK_ROOT" ]; then NDK_ROOT="$(ls -d /opt/android-sdk-linux/ndk/* 2>/dev/null | head -n1 || true)"; fi
+      if [ -z "$NDK_ROOT" ] || [ ! -d "$NDK_ROOT" ]; then echo "Android NDK not found in image"; exit 1; fi
+      export ANDROID_NDK_HOME="$NDK_ROOT"
+      TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
+      if [ ! -d "$TOOLCHAIN" ]; then echo "NDK toolchain not found at $TOOLCHAIN (runner must be x86_64)"; exit 1; fi
+
+      ABI_TRIPLE="aarch64-linux-android"
+      SYSROOT_LIB="$TOOLCHAIN/sysroot/usr/lib"
+      LIBCXX_PATH="$SYSROOT_LIB/$ABI_TRIPLE/$ANDROID_API/libc++_shared.so"
+      if [ ! -f "$LIBCXX_PATH" ]; then LIBCXX_PATH="$SYSROOT_LIB/$ABI_TRIPLE/libc++_shared.so"; fi
+      if [ ! -f "$LIBCXX_PATH" ]; then
+        echo "libc++_shared.so not found for $ABI_TRIPLE under $SYSROOT_LIB"
+        find "$SYSROOT_LIB" -path "*/libc++_shared.so" -print || true
+        exit 1
+      fi
+      python3 ci/scripts/check_elf_align.py "$TOOLCHAIN/bin/llvm-readelf" "$LIBCXX_PATH"
+
+      # --- Build Node.js for Android (cached) ----------------------------------------------
+      # The cache is reused only if the node submodule commit, patches, build scripts and NDK are unchanged.
+      NODE_STAMP="$( {
+        git rev-parse HEAD:node
+        cat tools/patches/*.patch tools/node/scripts/*.sh
+        basename "$NDK_ROOT"
+        echo "api=$ANDROID_API"
+      } | sha256sum | cut -d' ' -f1 )"
+      echo "Node build stamp: $NODE_STAMP"
+
+      if [ "${REBUILD_NODE:-0}" != "1" ] \
+        && [ -f "$NODE_CACHE_DIR/node" ] \
+        && [ "$(cat "$NODE_CACHE_DIR/stamp" 2>/dev/null || true)" = "$NODE_STAMP" ]; then
+        echo "Using cached Node.js binary"
+        mkdir -p out/android/arm64
+        cp -f "$NODE_CACHE_DIR/node" out/android/arm64/node
+      else
+        echo "Compiling Node.js from source (this takes a few hours)"
+        export NINJA_JOBS="${NINJA_JOBS:-$(nproc)}"
+        ./tools/node/scripts/build_node_android.sh arm64
+        mkdir -p "$NODE_CACHE_DIR"
+        cp -f out/android/arm64/node "$NODE_CACHE_DIR/node"
+        echo "$NODE_STAMP" > "$NODE_CACHE_DIR/stamp"
+      fi
+
+      mkdir -p app/src/main/jniLibs/arm64-v8a
+      cp out/android/arm64/node app/src/main/jniLibs/arm64-v8a/libnode.so
+      cp "$LIBCXX_PATH" app/src/main/jniLibs/arm64-v8a/libc++_shared.so
+      python3 ci/scripts/check_elf_align.py "$TOOLCHAIN/bin/llvm-readelf" \
+        app/src/main/jniLibs/arm64-v8a/libnode.so \
+        app/src/main/jniLibs/arm64-v8a/libc++_shared.so
+
+      # --- Bundle SillyTavern --------------------------------------------------------------
+      bash ci/scripts/build_st_bundle.sh
+
+      # --- Version + signing ---------------------------------------------------------------
+      export VERSION_CODE="${VERSION_CODE:-$CI_PIPELINE_IID}"
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then export VERSION_NAME="${VERSION_NAME:-$CI_COMMIT_TAG}"; fi
+
+      BUILD_MODE="debug"
+      if [ -n "${RELEASE_KEYSTORE_B64:-}" ]; then
+        mkdir -p ci/keystore
+        echo "$RELEASE_KEYSTORE_B64" | base64 -d > ci/keystore/release.jks
+        chmod 600 ci/keystore/release.jks
+        export RELEASE_STORE_FILE="$CI_PROJECT_DIR/ci/keystore/release.jks"
+        if [ -z "${RELEASE_KEY_PASSWORD:-}" ] && [ -n "${RELEASE_STORE_PASSWORD:-}" ]; then
+          export RELEASE_KEY_PASSWORD="$RELEASE_STORE_PASSWORD"
+        fi
+        BUILD_MODE="release"
+      fi
+
+      # --- Gradle --------------------------------------------------------------------------
+      if [ "$BUILD_MODE" = "release" ]; then
+        gradle :app:assembleRelease --stacktrace --no-daemon
+      else
+        gradle :app:assembleDebug --stacktrace --no-daemon
+      fi
+
+      mkdir -p dist
+      find app/build/outputs/apk -name '*.apk' -exec cp -v {} dist/ \;
+      rm -f ci/keystore/release.jks
+      ls -lh dist
+  artifacts:
+    name: "st-android-$CI_COMMIT_REF_SLUG-$CI_PIPELINE_IID"
+    paths:
+      - dist/*.apk
+    expire_in: 30 days
